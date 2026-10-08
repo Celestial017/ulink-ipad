@@ -69,6 +69,9 @@ final class StreamClient {
     private var pps: Data?
     private var formatDesc: CMFormatDescription?
     private var session: VTDecompressionSession?
+    private var lastVPS: Data?
+    private var lastSPS: Data?
+    private var lastPPS: Data?
     private var videoInfo = ""
     private var diagSkipDecode = false
     private var accCapacity = 0
@@ -294,7 +297,14 @@ final class StreamClient {
             }
         }
         formatDesc = fmt
-        if session == nil, let f = fmt { createDecoderSession(f) }
+        let changed = (vps != lastVPS || sps != lastSPS || pps != lastPPS)
+        lastVPS = vps
+        lastSPS = sps
+        lastPPS = pps
+        if let f = fmt, session == nil || changed {
+            // parameter sets changed (e.g. upstream encoder swap): rebuild the decoder session
+            createDecoderSession(f)
+        }
     }
 
     private func createDecoderSession(_ fmt: CMFormatDescription) {
