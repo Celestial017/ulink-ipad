@@ -365,7 +365,7 @@ final class StreamClient {
         var flagsOut = VTDecodeInfoFlags()
         let st = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sampleBuffer,
-            flags: [._EnableAsynchronousDecompression], infoFlagsOut: &flagsOut
+            flags: [], infoFlagsOut: &flagsOut
         ) { [weak self] status, _flags, imageBuffer, pts, _duration in
             guard let self else { return }
             self.inFlightLock.lock()
