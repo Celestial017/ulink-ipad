@@ -391,10 +391,8 @@ final class StreamClient {
     }
 
     private func present(_ imageBuffer: CVImageBuffer, pts: CMTime) {
-        guard let ios = CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() else { return }
-        surfaceLock.lock()
-        latestSurface = ios
-        surfaceLock.unlock()
+        // DIAGNOSTIC BUILD (v0.4.3): presentation intentionally disabled to isolate
+        // whether the per-frame memory retention lives in the display path or the read/decode path.
         presented += 1
     }
 
