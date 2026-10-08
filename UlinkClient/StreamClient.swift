@@ -87,6 +87,7 @@ final class StreamClient {
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
         addr.sin_addr.s_addr = INADDR_ANY
@@ -277,7 +278,7 @@ final class StreamClient {
             sampleBufferOut: &sampleBuffer)
         guard cs == noErr, let sb = sampleBuffer else { return }
         CMSetAttachment(sb, key: kCMSampleAttachmentKey_DisplayImmediately,
-                        value: kCFBooleanTrue, attachmentMode: .shouldPropagate)
+                        value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldPropagate)
 
         DispatchQueue.main.async { [weak self] in
             guard let layer = self?.displayLayer else { return }
