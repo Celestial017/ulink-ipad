@@ -1,0 +1,57 @@
+name: build-ipa
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project UlinkClient.xcodeproj \
+            -scheme UlinkClient -configuration Release \
+            -sdk iphoneos -arch arm64 \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/*.app Payload/
+          zip -r UlinkClient-unsigned.ipa Payload
+          ls -la UlinkClient-unsigned.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UlinkClient-unsigned-ipa
+          path: UlinkClient-unsigned.ipa
+
+      - name: Commit ipa to builds branch (backup fetch path)
+        run: |
+          mkdir -p /tmp/out
+          cp UlinkClient-unsigned.ipa /tmp/out/
+          cd /tmp/out
+          git init -q -b builds
+          git config user.name "ulink-ci"
+          git config user.email "ulink-ci@users.noreply.github.com"
+          git add UlinkClient-unsigned.ipa
+          git commit -q -m "build ${GITHUB_SHA} run ${GITHUB_RUN_NUMBER}"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" builds
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

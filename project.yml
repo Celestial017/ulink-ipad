@@ -1,0 +1,39 @@
+name: UlinkClient
+options:
+  bundleIdPrefix: dev.ulink
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+targets:
+  UlinkClient:
+    type: application
+    platform: iOS
+    sources:
+      - path: UlinkClient
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ulink.client
+        PRODUCT_NAME: U-Link
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "2"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+    info:
+      path: UlinkClient/Info.plist
+      properties:
+        CFBundleDisplayName: U-Link
+        UILaunchScreen: {}
+        UIRequiresFullScreen: false
+        UIApplicationSupportsIndirectInputEvents: true
+        CADisableMinimumFrameDurationOnPhone: true
+        NSLocalNetworkUsageDescription: "U-Link 需要访问本地网络，以接收电脑推送的画面。"
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
