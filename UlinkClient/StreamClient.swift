@@ -349,7 +349,7 @@ final class StreamClient {
         var flagsOut = VTDecodeInfoFlags()
         let st = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sampleBuffer,
-            flags: [.enableAsynchronousDecompression], infoFlagsOut: &flagsOut
+            flags: [._EnableAsynchronousDecompression], infoFlagsOut: &flagsOut
         ) { [weak self] status, _flags, imageBuffer, pts, _duration in
             guard let self else { return }
             self.inFlightLock.lock()
@@ -367,7 +367,8 @@ final class StreamClient {
             decErr += 1
             // decoder wedged? try a fresh session on repeated failures
             if decErr > 20, decErr % 20 == 0, let f = formatDesc {
-                session = nil
+                if let s = self.session { VTDecompressionSessionInvalidate(s) }
+                self.session = nil
                 createDecoderSession(f)
             }
         }
