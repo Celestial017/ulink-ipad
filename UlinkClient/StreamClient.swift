@@ -182,16 +182,21 @@ final class StreamClient {
             windowBytes += payload.count
             processAccessUnit(payload)
         case .ping:
-            guard payload.count >= 8 else { break }
-            var sent: UInt64 = 0
-            for i in 0..<8 { sent |= UInt64(payload[payload.startIndex + i]) << (8 * i) }
-            let nowUs = DispatchTime.now().uptimeNanoseconds / 1000
-            rttMs = Double(nowUs &- sent) / 1000.0
-            var out = Data([type])
-            let l = UInt32(payload.count)
-            out.append(contentsOf: [UInt8(l & 0xFF), UInt8((l >> 8) & 0xFF), UInt8((l >> 16) & 0xFF), UInt8((l >> 24) & 0xFF)])
-            out.append(payload)
-            send(connFd, out)
+            guard payload.count >= 12 else { break }
+            let p = [UInt8](payload.prefix(4))
+            if p == [0x55, 0x4C, 0x50, 0x47] {          // "ULPG": PC's ping -> echo exactly once
+                var out = Data([type])
+                let l = UInt32(payload.count)
+                out.append(contentsOf: [UInt8(l & 0xFF), UInt8((l >> 8) & 0xFF), UInt8((l >> 16) & 0xFF), UInt8((l >> 24) & 0xFF)])
+                out.append(payload)
+                send(connFd, out)
+            } else if p == [0x55, 0x4C, 0x41, 0x50] {   // "ULAP": our own ping returned -> measure RTT
+                var sent: UInt64 = 0
+                for i in 0..<8 { sent |= UInt64(payload[payload.startIndex + 4 + i]) << (8 * i) }
+                let nowUs = DispatchTime.now().uptimeNanoseconds / 1000
+                rttMs = Double(nowUs &- sent) / 1000.0
+            }
+            // anything else: ignore (prevents echo storms)
         case .config:
             if let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {
                 let w = obj["w"] as? Int ?? 0
@@ -406,7 +411,10 @@ final class StreamClient {
         windowStart = now
 
         let us = DispatchTime.now().uptimeNanoseconds / 1000
-        var out = Data([Pkt.ping.rawValue, 8, 0, 0, 0])
+        var out = Data([Pkt.ping.rawValue])
+        let lp: UInt32 = 12
+        out.append(contentsOf: [UInt8(lp & 0xFF), UInt8((lp >> 8) & 0xFF), UInt8((lp >> 16) & 0xFF), UInt8((lp >> 24) & 0xFF)])
+        out.append(contentsOf: [0x55, 0x4C, 0x41, 0x50])  // "ULAP"
         var v = us
         withUnsafeBytes(of: &v) { out.append(contentsOf: $0) }
         send(connFd, out)
