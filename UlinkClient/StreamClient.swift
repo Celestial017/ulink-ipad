@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import VideoToolbox
+import Darwin
 
 /// U-Link client: listens on a TCP port, parses the U-Link packet protocol
 /// (see docs/protocol.md), rebuilds HEVC sample buffers and hands them to the
@@ -20,6 +21,19 @@ final class StreamClient {
     var onStatus: ((String) -> Void)?
     var onConnected: (() -> Void)?
     var onDisconnected: (() -> Void)?
+    var onRebuildLayer: (() -> Void)?
+
+    // telemetry counters
+    private var totalFrames = 0
+    private var enqOk = 0
+    private var enqSkip = 0
+    private var layerFailures = 0
+    private var readTicks = 0
+
+    func replaceLayer(_ layer: AVSampleBufferDisplayLayer) {
+        displayLayer = layer
+        formatDesc = nil
+    }
 
     private let workQueue = DispatchQueue(label: "ulink.client")
     private var running = true
@@ -114,6 +128,7 @@ final class StreamClient {
         while running {
             let n = read(fd, &buf, buf.count)
             if n <= 0 { break }
+            readTicks += 1
             acc.append(buf, count: n)
             var consumed = true
             while consumed {
@@ -148,6 +163,7 @@ final class StreamClient {
         switch Pkt(rawValue: type) {
         case .video:
             windowFrames += 1
+            totalFrames += 1
             windowBytes += payload.count
             processAccessUnit(payload)
         case .ping:
@@ -269,7 +285,9 @@ final class StreamClient {
         guard st == kCMBlockBufferNoErr else { return }
 
         var sampleBuffer: CMSampleBuffer?
-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+        var timing = CMSampleTimingInfo(duration: .invalid,
+                                        presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+                                        decodeTimeStamp: .invalid)
         var sampleSize = count
         let cs = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: bb, formatDescription: formatDesc,
@@ -280,11 +298,18 @@ final class StreamClient {
         CMSetAttachment(sb, key: kCMSampleAttachmentKey_DisplayImmediately,
                         value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldPropagate)
 
-        DispatchQueue.main.async { [weak self] in
-            guard let layer = self?.displayLayer else { return }
-            if layer.status == .failed { layer.flush() }
-            layer.enqueue(sb)
+        guard let layer = displayLayer else { return }
+        if layer.status == .failed {
+            layerFailures += 1
+            DispatchQueue.main.async { [weak self] in self?.onRebuildLayer?() }
+            return
         }
+        if !layer.isReadyForMoreMediaData {
+            enqSkip += 1
+            return
+        }
+        layer.enqueue(sb)
+        enqOk += 1
     }
 
     // MARK: - stats
@@ -307,6 +332,28 @@ final class StreamClient {
         send(connFd, out)
 
         pushStatus()
+
+        // telemetry to PC so internal state is visible from the sender log
+        let telem = String(format: "{\"fr\":%d,\"enq\":%d,\"skip\":%d,\"lf\":%d,\"rd\":%d,\"memMB\":%.0f}",
+                           totalFrames, enqOk, enqSkip, layerFailures, readTicks, Self.rssMB())
+        if let td = telem.data(using: .utf8) {
+            var out4 = Data([Pkt.quality.rawValue])
+            let l4 = UInt32(td.count)
+            out4.append(contentsOf: [UInt8(l4 & 0xFF), UInt8((l4 >> 8) & 0xFF), UInt8((l4 >> 16) & 0xFF), UInt8((l4 >> 24) & 0xFF)])
+            out4.append(td)
+            send(connFd, out4)
+        }
+    }
+
+    private static func rssMB() -> Double {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576.0 : -1
     }
 
     private func pushStatus() {

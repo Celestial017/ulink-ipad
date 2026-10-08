@@ -3,7 +3,7 @@ import AVFoundation
 
 final class MirrorViewController: UIViewController {
 
-    private let displayLayer = AVSampleBufferDisplayLayer()
+    private var displayLayer = AVSampleBufferDisplayLayer()
     private let statusLabel = UILabel()
     private let hintLabel = UILabel()
     private var client: StreamClient?
@@ -80,6 +80,17 @@ final class MirrorViewController: UIViewController {
             guard let self else { return }
             self.statusLabel.text = "  " + text + "  "
             self.showStatusBriefly()
+        }
+        client.onRebuildLayer = { [weak self] in
+            guard let self else { return }
+            let newLayer = AVSampleBufferDisplayLayer()
+            newLayer.videoGravity = .resizeAspect
+            newLayer.backgroundColor = UIColor.black.cgColor
+            newLayer.frame = self.view.bounds
+            self.displayLayer.removeFromSuperlayer()
+            self.view.layer.addSublayer(newLayer)
+            self.displayLayer = newLayer
+            self.client?.replaceLayer(newLayer)
         }
         client.start()
         self.client = client
