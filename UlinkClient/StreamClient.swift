@@ -70,6 +70,8 @@ final class StreamClient {
     private var formatDesc: CMFormatDescription?
     private var session: VTDecompressionSession?
     private var videoInfo = ""
+    private var diagSkipDecode = false
+    private var accCapacity = 0
 
     init(port: UInt16) {
         self.port = port
@@ -138,25 +140,29 @@ final class StreamClient {
     }
 
     private func readLoop(_ fd: Int32) {
-        var buf = [UInt8](repeating: 0, count: 1 << 18)
-        var acc = Data()
+        // Flat byte buffer + one memmove per read chunk. Avoids Foundation.Data
+        // removeFirst()/append churn that appeared to retain ~one frame per frame.
+        var buf = [UInt8]()
+        buf.reserveCapacity(1 << 21)
+        var tmp = [UInt8](repeating: 0, count: 1 << 18)
         while running {
-            let n = read(fd, &buf, buf.count)
+            let n = read(fd, &tmp, tmp.count)
             if n <= 0 { break }
             readTicks += 1
-            acc.append(buf, count: n)
-            var consumed = true
-            while consumed {
-                consumed = false
-                guard acc.count >= 5 else { break }
-                let head = [UInt8](acc.prefix(5))
-                let len = UInt32(head[1]) | (UInt32(head[2]) << 8) | (UInt32(head[3]) << 16) | (UInt32(head[4]) << 24)
-                guard acc.count >= 5 + Int(len) else { break }
-                let payload = acc.subdata(in: (acc.startIndex + 5)..<(acc.startIndex + 5 + Int(len)))
-                acc.removeFirst(5 + Int(len))
-                handle(type: head[0], payload: payload)
-                consumed = true
+            buf.append(contentsOf: tmp[0..<n])
+            var pos = 0
+            while buf.count - pos >= 5 {
+                let len = UInt32(buf[pos + 1]) | (UInt32(buf[pos + 2]) << 8) | (UInt32(buf[pos + 3]) << 16) | (UInt32(buf[pos + 4]) << 24)
+                guard buf.count - pos >= 5 + Int(len) else { break }
+                let type = buf[pos]
+                let payload = Data(buf[(pos + 5)..<(pos + 5 + Int(len))])
+                pos += 5 + Int(len)
+                handle(type: type, payload: payload)
             }
+            if pos > 0 {
+                buf.removeFirst(pos)
+            }
+            accCapacity = buf.capacity
         }
     }
 
@@ -202,6 +208,7 @@ final class StreamClient {
                 let w = obj["w"] as? Int ?? 0
                 let h = obj["h"] as? Int ?? 0
                 let fps = obj["fps"] as? Int ?? 0
+                if let d = obj["diag"] as? Int { diagSkipDecode = (d == 1) }
                 videoInfo = "\(w)x\(h)@\(fps)"
                 pushStatus()
             }
@@ -349,6 +356,10 @@ final class StreamClient {
     }
 
     private func decode(_ sampleBuffer: CMSampleBuffer) {
+        if diagSkipDecode {
+            dropped += 1
+            return
+        }
         inFlightLock.lock()
         let busy = inFlight >= 3
         if !busy { inFlight += 1 }
@@ -391,8 +402,10 @@ final class StreamClient {
     }
 
     private func present(_ imageBuffer: CVImageBuffer, pts: CMTime) {
-        // DIAGNOSTIC BUILD (v0.4.3): presentation intentionally disabled to isolate
-        // whether the per-frame memory retention lives in the display path or the read/decode path.
+        guard let ios = CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() else { return }
+        surfaceLock.lock()
+        latestSurface = ios
+        surfaceLock.unlock()
         presented += 1
     }
 
@@ -419,8 +432,8 @@ final class StreamClient {
 
         pushStatus()
 
-        let telem = String(format: "{\"fr\":%d,\"dec\":%d,\"derr\":%d,\"drp\":%d,\"pre\":%d,\"shown\":%d,\"rd\":%d,\"memMB\":%.0f}",
-                           totalFrames, decOk, decErr, dropped, presented, shown, readTicks, Self.rssMB())
+        let telem = String(format: "{\"fr\":%d,\"dec\":%d,\"derr\":%d,\"drp\":%d,\"pre\":%d,\"shown\":%d,\"rd\":%d,\"cap\":%d,\"memMB\":%.0f}",
+                           totalFrames, decOk, decErr, dropped, presented, shown, readTicks, accCapacity, Self.rssMB())
         if let td = telem.data(using: .utf8) {
             var out4 = Data([Pkt.quality.rawValue])
             let l4 = UInt32(td.count)
