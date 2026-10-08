@@ -45,8 +45,23 @@ final class StreamClient {
     private var decErr = 0
     private var dropped = 0
     private var presented = 0
+    private var shown = 0
+    private let surfaceLock = NSLock()
+    private var latestSurface: IOSurface?
     private let inFlightLock = NSLock()
     private var inFlight = 0
+
+    /// Called from the CADisplayLink on the main thread: paint the newest decoded frame, drop stale ones.
+    func swapLatestSurface(into layer: CALayer) {
+        surfaceLock.lock()
+        let s = latestSurface
+        latestSurface = nil
+        surfaceLock.unlock()
+        if let s {
+            layer.contents = s
+            shown += 1
+        }
+    }
 
     // HEVC params / decoding
     private var vps: Data?
@@ -372,11 +387,10 @@ final class StreamClient {
 
     private func present(_ imageBuffer: CVImageBuffer, pts: CMTime) {
         guard let ios = CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() else { return }
+        surfaceLock.lock()
+        latestSurface = ios
+        surfaceLock.unlock()
         presented += 1
-        enqOk += 1
-        DispatchQueue.main.async { [weak self] in
-            self?.videoLayer?.contents = ios
-        }
     }
 
     // MARK: - stats / telemetry
@@ -399,8 +413,8 @@ final class StreamClient {
 
         pushStatus()
 
-        let telem = String(format: "{\"fr\":%d,\"dec\":%d,\"derr\":%d,\"drp\":%d,\"pre\":%d,\"lf\":%d,\"rd\":%d,\"memMB\":%.0f}",
-                           totalFrames, decOk, decErr, dropped, presented, layerFailures, readTicks, Self.rssMB())
+        let telem = String(format: "{\"fr\":%d,\"dec\":%d,\"derr\":%d,\"drp\":%d,\"pre\":%d,\"shown\":%d,\"rd\":%d,\"memMB\":%.0f}",
+                           totalFrames, decOk, decErr, dropped, presented, shown, readTicks, Self.rssMB())
         if let td = telem.data(using: .utf8) {
             var out4 = Data([Pkt.quality.rawValue])
             let l4 = UInt32(td.count)

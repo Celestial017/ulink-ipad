@@ -7,6 +7,7 @@ final class MirrorViewController: UIViewController {
     private let statusLabel = UILabel()
     private let hintLabel = UILabel()
     private var client: StreamClient?
+    private var displayLink: CADisplayLink?
     private var hideWork: DispatchWorkItem?
 
     override func viewDidLoad() {
@@ -83,6 +84,17 @@ final class MirrorViewController: UIViewController {
         }
         client.start()
         self.client = client
+
+        if displayLink == nil {
+            let link = CADisplayLink(target: self, selector: #selector(onDisplayTick))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        }
+    }
+
+    @objc private func onDisplayTick() {
+        client?.swapLatestSurface(into: videoLayer)
     }
 
     private func refreshHint(disconnected: Bool = false) {
