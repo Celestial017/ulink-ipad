@@ -1,11 +1,12 @@
 import Foundation
 import AVFoundation
 import VideoToolbox
+import CoreVideo
 import Darwin
 
-/// U-Link client: listens on a TCP port, parses the U-Link packet protocol
-/// (see docs/protocol.md), rebuilds HEVC sample buffers and hands them to the
-/// AVSampleBufferDisplayLayer for immediate presentation.
+/// U-Link client v0.3: explicit VideoToolbox HEVC decode into CVPixelBuffers,
+/// then present decoded frames through AVSampleBufferDisplayLayer (uncompressed path).
+/// All stages are counted and reported back to the PC as telemetry.
 final class StreamClient {
 
     enum Pkt: UInt8 {
@@ -23,24 +24,12 @@ final class StreamClient {
     var onDisconnected: (() -> Void)?
     var onRebuildLayer: (() -> Void)?
 
-    // telemetry counters
-    private var totalFrames = 0
-    private var enqOk = 0
-    private var enqSkip = 0
-    private var layerFailures = 0
-    private var readTicks = 0
-
-    func replaceLayer(_ layer: AVSampleBufferDisplayLayer) {
-        displayLayer = layer
-        formatDesc = nil
-    }
-
     private let workQueue = DispatchQueue(label: "ulink.client")
     private var running = true
     private var listenFd: Int32 = -1
     private var connFd: Int32 = -1
 
-    // stats
+    // stats (window) + cumulative telemetry
     private var windowFrames = 0
     private var windowBytes = 0
     private var windowStart = CFAbsoluteTimeGetCurrent()
@@ -48,11 +37,24 @@ final class StreamClient {
     private var lastMbps = 0.0
     private var rttMs = -1.0
 
-    // HEVC parameter sets / format
+    private var totalFrames = 0
+    private var enqOk = 0
+    private var enqSkip = 0
+    private var layerFailures = 0
+    private var readTicks = 0
+    private var decOk = 0
+    private var decErr = 0
+    private var dropped = 0
+    private var presented = 0
+    private let inFlightLock = NSLock()
+    private var inFlight = 0
+
+    // HEVC params / decoding
     private var vps: Data?
     private var sps: Data?
     private var pps: Data?
     private var formatDesc: CMFormatDescription?
+    private var session: VTDecompressionSession?
     private var videoInfo = ""
 
     init(port: UInt16) {
@@ -67,6 +69,10 @@ final class StreamClient {
         running = false
         if connFd >= 0 { close(connFd); connFd = -1 }
         if listenFd >= 0 { close(listenFd); listenFd = -1 }
+    }
+
+    func replaceLayer(_ layer: AVSampleBufferDisplayLayer) {
+        displayLayer = layer
     }
 
     // MARK: - socket loop
@@ -85,8 +91,7 @@ final class StreamClient {
             }
             connFd = c
             tuneSocket(c)
-            formatDesc = nil
-            videoInfo = ""
+            resetDecoder()
             DispatchQueue.main.async { self.onConnected?() }
             readLoop(c)
             close(c)
@@ -111,7 +116,7 @@ final class StreamClient {
             }
         }
         if st != 0 { close(fd); return -1 }
-        if listen(fd, 1) != 0 { close(fd); return -1 }
+        if listen(fd, 2) != 0 { close(fd); return -1 }
         return fd
     }
 
@@ -172,7 +177,6 @@ final class StreamClient {
             for i in 0..<8 { sent |= UInt64(payload[payload.startIndex + i]) << (8 * i) }
             let nowUs = DispatchTime.now().uptimeNanoseconds / 1000
             rttMs = Double(nowUs &- sent) / 1000.0
-            // echo verbatim
             var out = Data([type])
             let l = UInt32(payload.count)
             out.append(contentsOf: [UInt8(l & 0xFF), UInt8((l >> 8) & 0xFF), UInt8((l >> 16) & 0xFF), UInt8((l >> 24) & 0xFF)])
@@ -192,7 +196,7 @@ final class StreamClient {
         maybeEmitStats()
     }
 
-    // MARK: - HEVC handling
+    // MARK: - NAL handling
 
     static func splitNALs(_ data: Data) -> [Data] {
         var out: [Data] = []
@@ -240,7 +244,8 @@ final class StreamClient {
             avcc.append(nal)
         }
         guard avcc.count > 0 else { return }
-        makeSampleBuffer(avcc, formatDesc: fmt)
+        guard let sb = makeCompressedSampleBuffer(avcc, formatDesc: fmt) else { return }
+        decode(sb)
     }
 
     private func rebuildFormatDesc() {
@@ -267,9 +272,41 @@ final class StreamClient {
             }
         }
         formatDesc = fmt
+        if session == nil, let f = fmt { createDecoderSession(f) }
     }
 
-    private func makeSampleBuffer(_ avcc: Data, formatDesc: CMFormatDescription) {
+    private func createDecoderSession(_ fmt: CMFormatDescription) {
+        if let s = session {
+            VTDecompressionSessionInvalidate(s)
+            session = nil
+        }
+        let spec: [CFString: Any] = [kVTDecompressionPropertyKey_RealTime: kCFBooleanTrue as Any]
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        ]
+        var s: VTDecompressionSession?
+        let st = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault,
+                                              formatDescription: fmt,
+                                              decoderSpecification: spec as CFDictionary,
+                                              imageBufferAttributes: attrs as CFDictionary,
+                                              outputCallback: nil,
+                                              decompressionSessionOut: &s)
+        if st == noErr { session = s }
+    }
+
+    private func resetDecoder() {
+        if let s = session {
+            VTDecompressionSessionInvalidate(s)
+            session = nil
+        }
+        formatDesc = nil
+        videoInfo = ""
+        inFlightLock.lock()
+        inFlight = 0
+        inFlightLock.unlock()
+    }
+
+    private func makeCompressedSampleBuffer(_ avcc: Data, formatDesc: CMFormatDescription) -> CMSampleBuffer? {
         var blockBuffer: CMBlockBuffer?
         let count = avcc.count
         guard CMBlockBufferCreateWithMemoryBlock(
@@ -277,42 +314,92 @@ final class StreamClient {
             blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
             offsetToData: 0, dataLength: count, flags: 0,
             blockBufferOut: &blockBuffer) == kCMBlockBufferNoErr,
-            let bb = blockBuffer else { return }
+            let bb = blockBuffer else { return nil }
         let st = avcc.withUnsafeBytes {
             CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: bb,
                                           offsetIntoDestination: 0, dataLength: count)
         }
-        guard st == kCMBlockBufferNoErr else { return }
-
+        guard st == kCMBlockBufferNoErr else { return nil }
         var sampleBuffer: CMSampleBuffer?
-        var timing = CMSampleTimingInfo(duration: .invalid,
-                                        presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
-                                        decodeTimeStamp: .invalid)
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)
         var sampleSize = count
         let cs = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: bb, formatDescription: formatDesc,
-            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
             sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize,
             sampleBufferOut: &sampleBuffer)
-        guard cs == noErr, let sb = sampleBuffer else { return }
-        CMSetAttachment(sb, key: kCMSampleAttachmentKey_DisplayImmediately,
-                        value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        guard cs == noErr else { return nil }
+        return sampleBuffer
+    }
 
+    private func decode(_ sampleBuffer: CMSampleBuffer) {
+        inFlightLock.lock()
+        let busy = inFlight >= 3
+        if !busy { inFlight += 1 }
+        inFlightLock.unlock()
+        if busy {
+            dropped += 1
+            return
+        }
+        guard let session else {
+            dropped += 1
+            inFlightLock.lock(); inFlight -= 1; inFlightLock.unlock()
+            return
+        }
+        var flagsOut = VTDecodeInfoFlags()
+        let st = VTDecompressionSessionDecodeFrame(
+            session, sampleBuffer: sampleBuffer,
+            flags: [.enableAsynchronousDecompression], infoFlagsOut: &flagsOut
+        ) { [weak self] status, _flags, imageBuffer, pts, _duration in
+            guard let self else { return }
+            self.inFlightLock.lock()
+            if self.inFlight > 0 { self.inFlight -= 1 }
+            self.inFlightLock.unlock()
+            if status != noErr || imageBuffer == nil {
+                self.decErr += 1
+                return
+            }
+            self.decOk += 1
+            self.present(imageBuffer!, pts: pts)
+        }
+        if st != noErr {
+            inFlightLock.lock(); inFlight -= 1; inFlightLock.unlock()
+            decErr += 1
+            // decoder wedged? try a fresh session on repeated failures
+            if decErr > 20, decErr % 20 == 0, let f = formatDesc {
+                session = nil
+                createDecoderSession(f)
+            }
+        }
+    }
+
+    private func present(_ imageBuffer: CVImageBuffer, pts: CMTime) {
         guard let layer = displayLayer else { return }
         if layer.status == .failed {
             layerFailures += 1
             DispatchQueue.main.async { [weak self] in self?.onRebuildLayer?() }
             return
         }
-        if !layer.isReadyForMoreMediaData {
-            enqSkip += 1
-            return
-        }
-        layer.enqueue(sb)
+        var fmt: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: imageBuffer,
+            formatDescriptionOut: &fmt) == noErr, let f = fmt else { return }
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 120),
+                                        presentationTimeStamp: pts,
+                                        decodeTimeStamp: .invalid)
+        var sb: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: imageBuffer,
+            formatDescription: f, sampleTiming: &timing,
+            sampleBufferOut: &sb) == noErr, let out = sb else { return }
+        CMSetAttachment(out, key: kCMSampleAttachmentKey_DisplayImmediately,
+                        value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        layer.enqueue(out)
+        presented += 1
         enqOk += 1
     }
 
-    // MARK: - stats
+    // MARK: - stats / telemetry
 
     private func maybeEmitStats() {
         let now = CFAbsoluteTimeGetCurrent()
@@ -324,7 +411,6 @@ final class StreamClient {
         windowBytes = 0
         windowStart = now
 
-        // ping the PC every second
         let us = DispatchTime.now().uptimeNanoseconds / 1000
         var out = Data([Pkt.ping.rawValue, 8, 0, 0, 0])
         var v = us
@@ -333,9 +419,8 @@ final class StreamClient {
 
         pushStatus()
 
-        // telemetry to PC so internal state is visible from the sender log
-        let telem = String(format: "{\"fr\":%d,\"enq\":%d,\"skip\":%d,\"lf\":%d,\"rd\":%d,\"memMB\":%.0f}",
-                           totalFrames, enqOk, enqSkip, layerFailures, readTicks, Self.rssMB())
+        let telem = String(format: "{\"fr\":%d,\"dec\":%d,\"derr\":%d,\"drp\":%d,\"pre\":%d,\"lf\":%d,\"rd\":%d,\"memMB\":%.0f}",
+                           totalFrames, decOk, decErr, dropped, presented, layerFailures, readTicks, Self.rssMB())
         if let td = telem.data(using: .utf8) {
             var out4 = Data([Pkt.quality.rawValue])
             let l4 = UInt32(td.count)
@@ -343,6 +428,16 @@ final class StreamClient {
             out4.append(td)
             send(connFd, out4)
         }
+    }
+
+    private func pushStatus() {
+        let text: String
+        if videoInfo.isEmpty {
+            text = "已连接 · 等待画面…"
+        } else {
+            text = String(format: "%@ · %.0f fps · %.1f Mbps · RTT %.0f ms", videoInfo, lastFps, lastMbps, max(rttMs, 0))
+        }
+        DispatchQueue.main.async { self.onStatus?(text) }
     }
 
     private static func rssMB() -> Double {
@@ -354,15 +449,5 @@ final class StreamClient {
             }
         }
         return kr == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576.0 : -1
-    }
-
-    private func pushStatus() {
-        let text: String
-        if videoInfo.isEmpty {
-            text = String(format: "已连接 · 等待画面…")
-        } else {
-            text = String(format: "%@ · %.0f fps · %.1f Mbps · RTT %.0f ms", videoInfo, lastFps, lastMbps, max(rttMs, 0))
-        }
-        DispatchQueue.main.async { self.onStatus?(text) }
     }
 }
