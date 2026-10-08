@@ -16,8 +16,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.ulink.client
         PRODUCT_NAME: U-Link
-        MARKETING_VERSION: 0.4.5
-        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 1.0.0
+        CURRENT_PROJECT_VERSION: 2
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "2"
         CODE_SIGNING_ALLOWED: "NO"

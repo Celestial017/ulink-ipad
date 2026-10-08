@@ -1,7 +1,24 @@
 import UIKit
 import AVFoundation
 
+/// U-Link mirror UI v1.0 (rewrite).
+///
+/// Explicit connection state machine driven by StreamClient callbacks:
+///   .listening     -> banner "等待电脑连接…"
+///   .connected     -> banner hidden, video plays
+///   .stalled       -> banner "信号中断…" (link alive but no data)
+///   .disconnected  -> banner "连接断开，等待重连…"
+///
+/// On foreground: if the client's accept loop has died for any reason, it is
+/// recreated from scratch (self-healing after suspension / OOM kill / crash).
 final class MirrorViewController: UIViewController {
+
+    private enum State {
+        case listening
+        case connected
+        case stalled
+        case disconnected
+    }
 
     private var videoLayer = CALayer()
     private let statusLabel = UILabel()
@@ -65,25 +82,31 @@ final class MirrorViewController: UIViewController {
     override var prefersHomeIndicatorAutoHidden: Bool { true }
 
     private func startClient() {
-        refreshHint()
-        let client = StreamClient(port: 52700)
-        client.videoLayer = videoLayer
-        client.onConnected = { [weak self] in
-            self?.hintLabel.isHidden = true
+        // only ever replaces a dead client (or builds the first one)
+        if let old = client {
+            guard !old.isAlive else { return }
+            old.stop()
+        }
+        client = nil
+
+        showBanner(.listening)
+
+        let c = StreamClient(port: 52700)
+        c.videoLayer = videoLayer
+        c.onListening = { [weak self] in self?.showBanner(.listening) }
+        c.onConnected = { [weak self] in
+            self?.showBanner(nil)
             self?.showStatusBriefly()
         }
-        client.onDisconnected = { [weak self] in
-            guard let self else { return }
-            self.hintLabel.isHidden = false
-            self.refreshHint(disconnected: true)
-        }
-        client.onStatus = { [weak self] text in
+        c.onStalled = { [weak self] in self?.showBanner(.stalled) }
+        c.onDisconnected = { [weak self] in self?.showBanner(.disconnected) }
+        c.onStatus = { [weak self] text in
             guard let self else { return }
             self.statusLabel.text = "  " + text + "  "
             self.showStatusBriefly()
         }
-        client.start()
-        self.client = client
+        c.start()
+        client = c
 
         if displayLink == nil {
             let link = CADisplayLink(target: self, selector: #selector(onDisplayTick))
@@ -97,10 +120,24 @@ final class MirrorViewController: UIViewController {
         client?.swapLatestSurface(into: videoLayer)
     }
 
-    private func refreshHint(disconnected: Bool = false) {
+    private func showBanner(_ state: State?) {
         let ip = NetworkInfo.wifiAddress() ?? "未知"
-        let head = disconnected ? "连接断开，等待重连…" : "等待电脑连接…"
-        hintLabel.text = "U-Link\n\n\(head)\niPad 地址 \(ip):52700\n\n轻点屏幕查看状态"
+        switch state {
+        case nil:
+            hintLabel.isHidden = true
+        case .listening:
+            hintLabel.text = "U-Link\n\n等待电脑连接…\niPad 地址 \(ip):52700\n\n轻点屏幕查看状态"
+            hintLabel.isHidden = false
+        case .connected:
+            hintLabel.isHidden = true
+        case .stalled:
+            hintLabel.text = "U-Link\n\n信号中断…\n正在等待数据 / 自动恢复\n\n轻点屏幕查看状态"
+            hintLabel.isHidden = false
+        case .disconnected:
+            hintLabel.text = "U-Link\n\n连接断开，等待重连…\n电脑端请重跑 启动投屏.bat\n\n轻点屏幕查看状态"
+            hintLabel.isHidden = false
+        }
+        if state != nil { statusLabel.alpha = 0 }
     }
 
     @objc private func showStatusBriefly() {
@@ -118,8 +155,12 @@ final class MirrorViewController: UIViewController {
 
     @objc private func willEnterForeground() {
         UIApplication.shared.isIdleTimerDisabled = true
+        // self-heal: resurrect the receiver if its accept loop died while
+        // backgrounded/suspended (OOM kill, crash, iOS socket teardown, ...)
+        startClient()
     }
 
     @objc private func didEnterBackground() {
+        // stream pauses while suspended; willEnterForeground heals/resumes
     }
 }

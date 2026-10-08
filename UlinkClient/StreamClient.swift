@@ -4,9 +4,26 @@ import VideoToolbox
 import CoreVideo
 import Darwin
 
-/// U-Link client v0.3: explicit VideoToolbox HEVC decode into CVPixelBuffers,
-/// then present decoded frames through AVSampleBufferDisplayLayer (uncompressed path).
-/// All stages are counted and reported back to the PC as telemetry.
+/// U-Link client v1.0 (rewrite): self-healing receiver.
+///
+/// Design goals, in order:
+///  1. The TCP listener NEVER dies silently. bind/listen failures retry every
+///     second; the accept loop cannot exit while the client is alive.
+///  2. A half-dead connection (PC sender killed, USB tunnel frozen) must not
+///     wedge the receiver: TCP keepalive (5s idle) + an app-level watchdog
+///     (6s without any bytes -> shutdown()) force blocked reads to return,
+///     and the loop goes straight back to accept().
+///  3. Every state change is reported to the UI: listening / connected /
+///     stalled / disconnected.
+///  4. The decode path is the proven v0.4.5 stack: VideoToolbox HEVC realtime
+///     decode into IOSurfaces, latest-frame mailbox drained by CADisplayLink,
+///     decoder session rebuilt when parameter sets change.
+///
+/// Protocol (docs/protocol.md): type u8 + length u32 LE + payload.
+///  0x01 VideoPacket (one HEVC access unit, Annex-B)
+///  0x02 Config (UTF-8 JSON)
+///  0x03 Ping (PC "ULPG" -> echoed verbatim; app "ULAP" -> RTT measurement)
+///  0x04 Quality (app -> PC telemetry JSON)
 final class StreamClient {
 
     enum Pkt: UInt8 {
@@ -22,11 +39,41 @@ final class StreamClient {
     var onStatus: ((String) -> Void)?
     var onConnected: (() -> Void)?
     var onDisconnected: (() -> Void)?
+    var onListening: (() -> Void)?
+    var onStalled: (() -> Void)?
 
     private let workQueue = DispatchQueue(label: "ulink.client")
-    private var running = true
-    private var listenFd: Int32 = -1
-    private var connFd: Int32 = -1
+
+    // ---- guarded by stateLock ----
+    private let stateLock = NSLock()
+    private var _running = true
+    private var _loopAlive = false
+    private var _listenFd: Int32 = -1
+    private var _connFd: Int32 = -1
+    private var _lastRx = 0.0            // CFAbsoluteTime of last received byte
+    private var _stallNotified = false
+    private var _bindFailReported = false
+    // ------------------------------
+
+    /// True while the accept loop is alive (used by the UI to resurrect a dead client).
+    var isAlive: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _loopAlive
+    }
+
+    private var running: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _running }
+        set { stateLock.lock(); _running = newValue; stateLock.unlock() }
+    }
+
+    private var connFd: Int32 {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _connFd
+    }
+
+    private func markRx() {
+        stateLock.lock(); _lastRx = CFAbsoluteTimeGetCurrent(); stateLock.unlock()
+    }
 
     // stats (window) + cumulative telemetry
     private var windowFrames = 0
@@ -81,37 +128,93 @@ final class StreamClient {
     }
 
     func start() {
+        stateLock.lock(); _loopAlive = true; stateLock.unlock()
         workQueue.async { [weak self] in self?.runLoop() }
+        DispatchQueue.global(qos: .utility).async { [weak self] in self?.watchdogLoop() }
     }
 
     func stop() {
         running = false
-        if connFd >= 0 { close(connFd); connFd = -1 }
-        if listenFd >= 0 { close(listenFd); listenFd = -1 }
+        stateLock.lock()
+        let l = _listenFd, c = _connFd
+        _listenFd = -1
+        _connFd = -1
+        stateLock.unlock()
+        if l >= 0 { close(l) }
+        if c >= 0 { close(c) }
     }
 
-    // MARK: - socket loop
+    // MARK: - supervised accept loop
 
     private func runLoop() {
-        listenFd = makeListener()
-        guard listenFd >= 0 else {
-            DispatchQueue.main.async { self.onStatus?("监听端口失败 (\(self.port))") }
-            return
+        defer {
+            stateLock.lock(); _loopAlive = false; stateLock.unlock()
         }
+
         while running {
-            let c = accept(listenFd, nil, nil)
+            // (re)create the listener if missing
+            stateLock.lock()
+            let needListener = _listenFd < 0
+            stateLock.unlock()
+            if needListener {
+                let fd = makeListener()
+                if fd < 0 {
+                    // bind/listen failed: report once per streak, retry every second, forever
+                    stateLock.lock()
+                    let reported = _bindFailReported
+                    _bindFailReported = true
+                    stateLock.unlock()
+                    if !reported {
+                        emit { self.onStatus?("端口 \(self.port) 监听失败，正在重试…") }
+                    }
+                    usleep(useconds_t(1_000_000))
+                    continue
+                }
+                stateLock.lock()
+                _listenFd = fd
+                _bindFailReported = false
+                stateLock.unlock()
+                emit { self.onListening?() }
+            }
+
+            stateLock.lock()
+            let lf = _listenFd
+            stateLock.unlock()
+            let c = accept(lf, nil, nil)
             if c < 0 {
                 if !running { break }
+                if errno == EBADF || errno == EINVAL {
+                    // listener was closed under us (or died): recreate it
+                    stateLock.lock()
+                    let dead = _listenFd
+                    _listenFd = -1
+                    stateLock.unlock()
+                    if dead >= 0 { close(dead) }
+                } else {
+                    usleep(useconds_t(100_000))   // transient error: avoid busy spin
+                }
                 continue
             }
-            connFd = c
+
+            // accepted a PC connection
             tuneSocket(c)
+            stateLock.lock()
+            _connFd = c
+            _lastRx = CFAbsoluteTimeGetCurrent()
+            _stallNotified = false
+            stateLock.unlock()
             resetDecoder()
-            DispatchQueue.main.async { self.onConnected?() }
+            resetWindow()
+            emit { self.onConnected?() }
+
             readLoop(c)
-            close(c)
-            connFd = -1
-            DispatchQueue.main.async { self.onDisconnected?() }
+
+            stateLock.lock()
+            let cf = _connFd
+            _connFd = -1
+            stateLock.unlock()
+            if cf >= 0 { close(cf) }
+            emit { self.onDisconnected?() }
         }
     }
 
@@ -131,36 +234,87 @@ final class StreamClient {
             }
         }
         if st != 0 { close(fd); return -1 }
-        if listen(fd, 2) != 0 { close(fd); return -1 }
+        if listen(fd, 8) != 0 { close(fd); return -1 }
         return fd
     }
 
     private func tuneSocket(_ fd: Int32) {
         var nosigpipe: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, socklen_t(MemoryLayout<Int32>.size))
-        var rcvbuf: Int32 = 1 << 20
+        var rcvbuf: Int32 = 4 << 20
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, socklen_t(MemoryLayout<Int32>.size))
+        var nodelay: Int32 = 1
+        setsockopt(fd, Int32(IPPROTO_TCP), TCP_NODELAY, &nodelay, socklen_t(MemoryLayout<Int32>.size))
+        // aggressive keepalive: dead peer detected by the OS within ~11s even if
+        // the app-level watchdog somehow misses it
+        var idle: Int32 = 5
+        setsockopt(fd, Int32(IPPROTO_TCP), TCP_KEEPALIVE, &idle, socklen_t(MemoryLayout<Int32>.size))
+        var intvl: Int32 = 2
+        setsockopt(fd, Int32(IPPROTO_TCP), TCP_KEEPINTVL, &intvl, socklen_t(MemoryLayout<Int32>.size))
+        var cnt: Int32 = 3
+        setsockopt(fd, Int32(IPPROTO_TCP), TCP_KEEPCNT, &cnt, socklen_t(MemoryLayout<Int32>.size))
     }
+
+    /// Detects a wedged connection: no bytes at all while "connected".
+    /// 3s -> tell the UI (stalled); 6s -> shutdown() to force the blocked read() to
+    /// return so the accept loop can take over again.
+    private func watchdogLoop() {
+        while true {
+            Thread.sleep(forTimeInterval: 1.0)
+            stateLock.lock()
+            let alive = _running && _loopAlive
+            let fd = _connFd
+            let idle = CFAbsoluteTimeGetCurrent() - _lastRx
+            let stalled = _stallNotified
+            stateLock.unlock()
+            guard alive else { return }
+            guard fd >= 0 else { continue }
+            if idle > 3.0 && !stalled {
+                stateLock.lock(); _stallNotified = true; stateLock.unlock()
+                emit { self.onStalled?() }
+            }
+            if idle > 6.0 {
+                shutdown(fd, Int32(SHUT_RDWR))
+            }
+        }
+    }
+
+    // MARK: - connection read loop
 
     private func readLoop(_ fd: Int32) {
         // Flat byte buffer + one memmove per read chunk. Avoids Foundation.Data
-        // removeFirst()/append churn that appeared to retain ~one frame per frame.
+        // removeFirst()/append churn.
         var buf = [UInt8]()
         buf.reserveCapacity(1 << 21)
         var tmp = [UInt8](repeating: 0, count: 1 << 18)
         while running {
             let n = read(fd, &tmp, tmp.count)
-            if n <= 0 { break }
+            if n == 0 { break }                    // EOF: PC closed the tunnel
+            if n < 0 {
+                if errno == EINTR { continue }
+                break                              // e.g. EBADF after watchdog shutdown
+            }
             readTicks += 1
+            markRx()
             buf.append(contentsOf: tmp[0..<n])
             var pos = 0
+            var desynced = false
             while buf.count - pos >= 5 {
                 let len = UInt32(buf[pos + 1]) | (UInt32(buf[pos + 2]) << 8) | (UInt32(buf[pos + 3]) << 16) | (UInt32(buf[pos + 4]) << 24)
+                if len > (64 << 20) { desynced = true; break }   // impossible size: framing lost
                 guard buf.count - pos >= 5 + Int(len) else { break }
                 let type = buf[pos]
-                let payload = Data(buf[(pos + 5)..<(pos + 5 + Int(len))])
+                let payload = buf.withUnsafeBytes { raw -> Data in
+                    Data(bytes: raw.baseAddress!.advanced(by: pos + 5), count: Int(len))
+                }
                 pos += 5 + Int(len)
                 handle(type: type, payload: payload)
+            }
+            if desynced {
+                // drop the buffer and keep the connection; the next packets will
+                // re-frame (each frame is standalone thanks to intra refresh GOP)
+                buf.removeAll(keepingCapacity: true)
+                continue
             }
             if pos > 0 {
                 buf.removeFirst(pos)
@@ -169,7 +323,9 @@ final class StreamClient {
         }
     }
 
-    private func send(_ fd: Int32, _ data: Data) {
+    private func send(_ data: Data) {
+        let fd = connFd
+        guard fd >= 0 else { return }
         data.withUnsafeBytes { ptr in
             guard let base = ptr.baseAddress else { return }
             var off = 0
@@ -179,6 +335,10 @@ final class StreamClient {
                 off += w
             }
         }
+    }
+
+    private func emit(_ block: @escaping () -> Void) {
+        DispatchQueue.main.async(execute: block)
     }
 
     // MARK: - packet handling
@@ -198,10 +358,10 @@ final class StreamClient {
                 let l = UInt32(payload.count)
                 out.append(contentsOf: [UInt8(l & 0xFF), UInt8((l >> 8) & 0xFF), UInt8((l >> 16) & 0xFF), UInt8((l >> 24) & 0xFF)])
                 out.append(payload)
-                send(connFd, out)
+                send(out)
             } else if p == [0x55, 0x4C, 0x41, 0x50] {   // "ULAP": our own ping returned -> measure RTT
                 var sent: UInt64 = 0
-                for i in 0..<8 { sent |= UInt64(payload[payload.startIndex + 4 + i]) << (8 * i) }
+                for i in 0..<8 { sent |= UInt64(payload[payload.startIndex + 4 + i]) << (8 * UInt64(i)) }
                 let nowUs = DispatchTime.now().uptimeNanoseconds / 1000
                 rttMs = Double(nowUs &- sent) / 1000.0
             }
@@ -339,6 +499,12 @@ final class StreamClient {
         inFlightLock.unlock()
     }
 
+    private func resetWindow() {
+        windowFrames = 0
+        windowBytes = 0
+        windowStart = CFAbsoluteTimeGetCurrent()
+    }
+
     private func makeCompressedSampleBuffer(_ avcc: Data, formatDesc: CMFormatDescription) -> CMSampleBuffer? {
         var blockBuffer: CMBlockBuffer?
         let count = avcc.count
@@ -438,7 +604,7 @@ final class StreamClient {
         out.append(contentsOf: [0x55, 0x4C, 0x41, 0x50])  // "ULAP"
         var v = us
         withUnsafeBytes(of: &v) { out.append(contentsOf: $0) }
-        send(connFd, out)
+        send(out)
 
         pushStatus()
 
@@ -449,7 +615,7 @@ final class StreamClient {
             let l4 = UInt32(td.count)
             out4.append(contentsOf: [UInt8(l4 & 0xFF), UInt8((l4 >> 8) & 0xFF), UInt8((l4 >> 16) & 0xFF), UInt8((l4 >> 24) & 0xFF)])
             out4.append(td)
-            send(connFd, out4)
+            send(out4)
         }
     }
 
