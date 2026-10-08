@@ -18,11 +18,10 @@ final class StreamClient {
 
     let port: UInt16
 
-    weak var displayLayer: AVSampleBufferDisplayLayer?
+    weak var videoLayer: CALayer?
     var onStatus: ((String) -> Void)?
     var onConnected: (() -> Void)?
     var onDisconnected: (() -> Void)?
-    var onRebuildLayer: (() -> Void)?
 
     private let workQueue = DispatchQueue(label: "ulink.client")
     private var running = true
@@ -69,10 +68,6 @@ final class StreamClient {
         running = false
         if connFd >= 0 { close(connFd); connFd = -1 }
         if listenFd >= 0 { close(listenFd); listenFd = -1 }
-    }
-
-    func replaceLayer(_ layer: AVSampleBufferDisplayLayer) {
-        displayLayer = layer
     }
 
     // MARK: - socket loop
@@ -283,6 +278,7 @@ final class StreamClient {
         let spec: [CFString: Any] = [kVTDecompressionPropertyKey_RealTime: kCFBooleanTrue as Any]
         let attrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey as String: NSDictionary(),
         ]
         var s: VTDecompressionSession?
         let st = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault,
@@ -375,29 +371,12 @@ final class StreamClient {
     }
 
     private func present(_ imageBuffer: CVImageBuffer, pts: CMTime) {
-        guard let layer = displayLayer else { return }
-        if layer.status == .failed {
-            layerFailures += 1
-            DispatchQueue.main.async { [weak self] in self?.onRebuildLayer?() }
-            return
-        }
-        var fmt: CMVideoFormatDescription?
-        guard CMVideoFormatDescriptionCreateForImageBuffer(
-            allocator: kCFAllocatorDefault, imageBuffer: imageBuffer,
-            formatDescriptionOut: &fmt) == noErr, let f = fmt else { return }
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 120),
-                                        presentationTimeStamp: pts,
-                                        decodeTimeStamp: .invalid)
-        var sb: CMSampleBuffer?
-        guard CMSampleBufferCreateReadyWithImageBuffer(
-            allocator: kCFAllocatorDefault, imageBuffer: imageBuffer,
-            formatDescription: f, sampleTiming: &timing,
-            sampleBufferOut: &sb) == noErr, let out = sb else { return }
-        CMSetAttachment(out, key: kCMSampleAttachmentKey_DisplayImmediately,
-                        value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldPropagate)
-        layer.enqueue(out)
+        guard let ios = CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() else { return }
         presented += 1
         enqOk += 1
+        DispatchQueue.main.async { [weak self] in
+            self?.videoLayer?.contents = ios
+        }
     }
 
     // MARK: - stats / telemetry
